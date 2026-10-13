@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "fastapi",
+  "functions": {
+    "backend/server.py": {
+      "maxDuration": 300,
+      "includeFiles": "frontend/build/**"
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/tick",
+      "schedule": "30 6 * * *"
+    }
+  ]
+}
