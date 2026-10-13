@@ -38,6 +38,14 @@ and the backend (FastAPI, Python) runs as a Vercel function.
    (The super admin is created automatically on the first sign-in.)
 5. If you add `PUBLIC_BASE_URL` after the first deploy: Deployments → ⋯ → **Redeploy**.
 
+## Check it works
+Open `https://<your-project>.vercel.app/api/health`
+- `"database":"ok"` → all good, open the site and sign in.
+- otherwise it says what is wrong (MONGO_URL password, `<db_password>` left in, Atlas Network Access…).
+  Fix the variable in Vercel → Settings → Environment Variables → **Redeploy**.
+
+If the site shows an error page instead of the login, it now prints the reason — send a screenshot.
+
 ## 4. Scheduled jobs (WhatsApp summary, absent alerts, static-IP machine pulls)
 - Vercel's free plan runs `/api/cron/tick` once a day (about 12 pm IST) from `vercel.json`.
 - For exact times / every 5 minutes: create a free job at **https://cron-job.org** calling
