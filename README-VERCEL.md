@@ -51,11 +51,23 @@ If the site shows an error page instead of the login, it now prints the reason �
 - For exact times / every 5 minutes: create a free job at **https://cron-job.org** calling
   `https://<your-project>.vercel.app/api/cron/tick?key=<CRON_SECRET>` every 5 minutes.
 
-## 5. Biometric machines with Vercel
-- eSSL / ZKTeco on the shop's LAN → use the **LAN sync agent** (Hayat-Sync-Agent.zip) on a PC in the shop.
-- eSSL with ADMS + HTTPS option → server = your domain, port 443, HTTPS on.
+## 5. Biometric machines at the shop (added "locally")
+Vercel is on the internet and cannot see 192.168.x.x machines by itself. One small program at the shop does it:
+1. In the web app: **Biometric devices → Add machine** → mode **LAN agent** → enter the machine's local IP (e.g. 192.168.10.3).
+2. Copy the **Agent setup code** from the LAN agent box on the same page.
+3. On any always-on PC at the shop run **Hayat-Sync-Agent-Setup.exe** (Python is inside — nothing else to install)
+   and paste the setup code when it asks. It starts with Windows and sends punches every minute.
+- eSSL with ADMS + HTTPS option → server = your domain, port 443, HTTPS on (no agent needed).
 - Hikvision → HTTP push (HTTPS, port 443) or the LAN agent.
 - Machines on a static public IP → "Direct pull" works through the cron above or the **Sync all** button.
+
+## Logins with validity (super admin)
+**Logins & validity** in the super-admin menu: create an owner / manager / employee login for any shop with a
+"valid till" date. After that date the login cannot sign in until you renew it (+1 month / +1 year buttons).
+
+## Employee login
+Owner → **Employees** → **Login** on an employee → set a password. The employee signs in with their mobile
+number and sees only their own attendance (first IN, last OUT, all punches, hours, OT) and final salary slips.
 
 ## 6. Licence server
 With `LICENSE_PRIVATE_KEY` set, **Licence keys** appears in the super-admin menu. Customers' local installs

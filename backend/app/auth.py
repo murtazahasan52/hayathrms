@@ -52,7 +52,18 @@ async def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer)):
         raise HTTPException(401, "User disabled")
     if int(data.get("tv") or 0) != int(user.get("token_version") or 0):
         raise HTTPException(401, "You were logged out. Please sign in again.")
+    msg = login_expired(user)
+    if msg:
+        raise HTTPException(401, msg)
     return user
+
+
+def login_expired(user):
+    """Each login can have its own validity date (set by the super admin / owner)."""
+    vt = user.get("valid_till")
+    if vt and user.get("role") != "superadmin" and vt < datetime.date.today().isoformat():
+        return f"Your login expired on {vt}. Contact your administrator to renew it."
+    return None
 
 
 async def superadmin(user=Depends(current_user)):
@@ -63,6 +74,19 @@ async def superadmin(user=Depends(current_user)):
 
 async def company_ctx(user=Depends(current_user), x_company_id: str = Header(None)):
     """Resolves the company the request works on. Super admin picks one with X-Company-Id."""
+    if user["role"] == "employee":
+        raise HTTPException(403, "Employee logins can only see their own attendance and salary slips")
+    return await _company(user, x_company_id)
+
+
+async def employee_ctx(user=Depends(current_user)):
+    """Employee self-service login: one employee, own data only."""
+    if user["role"] != "employee" or not user.get("employee_id"):
+        raise HTTPException(403, "Employee login only")
+    return await _company(user, None)
+
+
+async def _company(user, x_company_id):
     cid = x_company_id if user["role"] == "superadmin" else user.get("company_id")
     if not cid:
         raise HTTPException(400, "Select a company first")

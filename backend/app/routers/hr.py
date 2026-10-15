@@ -16,7 +16,7 @@ router = APIRouter(prefix="/api")
 EMP_FIELDS = ("code", "extra_codes", "name", "phone", "email", "department", "designation", "shift_id", "joining_date",
               "leaving_date", "salary_type", "earnings", "daily_rate", "hourly_rate", "ot_allowed", "ot_rate_per_hour",
               "pf_enabled", "esi_enabled", "pt_amount", "other_deductions", "bank_account", "ifsc", "uan", "weekly_off",
-              "whatsapp_alerts", "active", "gender", "address", "esi_no", "pan")
+              "whatsapp_alerts", "active", "gender", "address", "esi_no", "pan", "ot_mode", "ot_fixed_amount")
 
 
 def _clean_emp(data):
@@ -30,7 +30,7 @@ def _clean_emp(data):
         if isinstance(v, str):
             v = [x.strip() for x in v.split(",")]
         e["extra_codes"] = [str(x) for x in v if str(x).strip()]
-    for k in ("daily_rate", "hourly_rate", "ot_rate_per_hour", "pt_amount"):
+    for k in ("daily_rate", "hourly_rate", "ot_rate_per_hour", "pt_amount", "ot_fixed_amount"):
         if k in e:
             e[k] = float(e[k] or 0)
     for k in ("earnings", "other_deductions"):
@@ -322,12 +322,25 @@ async def list_shifts(ctx: Ctx = Depends(company_ctx)):
 
 
 SHIFT_FIELDS = ("name", "start", "end", "grace_minutes", "early_grace_minutes", "full_day_hours", "half_day_hours",
-                "break_minutes", "ot_after_minutes", "weekly_off", "is_default")
+                "break_minutes", "ot_after_minutes", "weekly_off", "is_default", "track_late", "track_ot", "present_on_punch",
+                "flexible", "day_start")
+
+
+def _flex_defaults(s):
+    """Flexible shift: no fixed timing — first punch IN, last punch OUT, hours decide P / HD."""
+    if s.get("flexible"):
+        s.setdefault("start", "00:00")
+        s.setdefault("end", "23:59")
+        s["track_late"] = False
+        s.setdefault("day_start", "04:00")
+        s.setdefault("full_day_hours", 8)
+        s.setdefault("half_day_hours", 4)
+    return s
 
 
 @router.post("/shifts")
 async def add_shift(data: dict = Body(...), ctx: Ctx = Depends(company_ctx)):
-    s = {k: data[k] for k in SHIFT_FIELDS if k in data}
+    s = _flex_defaults({k: data[k] for k in SHIFT_FIELDS if k in data})
     s.update(id=new_id(), company_id=ctx.cid)
     if s.get("is_default"):
         await db.shifts.update_many({"company_id": ctx.cid}, {"$set": {"is_default": False}})
@@ -337,7 +350,7 @@ async def add_shift(data: dict = Body(...), ctx: Ctx = Depends(company_ctx)):
 
 @router.put("/shifts/{sid}")
 async def edit_shift(sid: str, data: dict = Body(...), ctx: Ctx = Depends(company_ctx)):
-    s = {k: data[k] for k in SHIFT_FIELDS if k in data}
+    s = _flex_defaults({k: data[k] for k in SHIFT_FIELDS if k in data})
     if s.get("is_default"):
         await db.shifts.update_many({"company_id": ctx.cid}, {"$set": {"is_default": False}})
     await db.shifts.update_one({"id": sid, "company_id": ctx.cid}, {"$set": s})

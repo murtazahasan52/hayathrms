@@ -51,8 +51,13 @@ def server_base(request: Request):
 @router.get("/devices")
 async def list_devices(request: Request, ctx: Ctx = Depends(company_ctx)):
     rows = await db.devices.find({"company_id": ctx.cid}, {"_id": 0}).to_list(200)
-    return {"devices": [_public(d) for d in rows], "server_base": server_base(request),
-            "agent_key": ctx.company.get("agent_key") if ctx.role in ("owner", "superadmin") else None}
+    key = ctx.company.get("agent_key") if ctx.role in ("owner", "superadmin") else None
+    code = None
+    if key:
+        import base64, json
+        raw = json.dumps({"u": server_base(request), "k": key}, separators=(",", ":")).encode()
+        code = "HAYATAGENT." + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return {"devices": [_public(d) for d in rows], "server_base": server_base(request), "agent_key": key, "setup_code": code}
 
 
 @router.post("/devices")
@@ -317,6 +322,52 @@ async def sync_device(did: str, data: dict = Body(default={}), ctx: Ctx = Depend
     return {"ok": False, "message": "Hikvision push mode only receives live events. Use LAN agent or direct mode to fetch old logs."}
 
 
+@router.post("/devices/fetch-photos")
+async def fetch_photos(data: dict = Body(default={}), ctx: Ctx = Depends(company_ctx)):
+    """Employee face photos from the machines. Hikvision: read directly. eSSL direct (Windows PC): eSSL SDK.
+    LAN agent: the agent reads them on its next round. eSSL ADMS: the machine is asked to send them."""
+    from ..services.device_sync import pull_photos
+    from ..services.essl_photos import fetch_photos as essl_fetch
+    q = {"company_id": ctx.cid}
+    if data.get("device_ids"):
+        q["id"] = {"$in": data["device_ids"]}
+    results, total = [], 0
+    for d in await db.devices.find(q, {"_id": 0}).to_list(200):
+        name, mode, brand = d.get("name"), d.get("mode"), d.get("brand")
+        try:
+            if mode == "direct" and brand == "hikvision":
+                n = await pull_photos(ctx.company, d, force=True)
+                total += n
+                results.append({"device": name, "ok": True, "photos": n, "message": f"{n} face photo(s) read"})
+            elif mode == "direct":
+                pins = sorted({u["user_code"] async for u in db.device_users.find({"company_id": ctx.cid}, {"user_code": 1})}
+                              | {e["code"] async for e in db.employees.find({"company_id": ctx.cid, "active": {"$ne": False}}, {"code": 1})})
+                got, msg = await asyncio.to_thread(essl_fetch, d["ip"], d.get("port") or 4370, d.get("comm_key") or 0, pins)
+                n = 0
+                for pin, raw in got.items():
+                    n += bool(await save_photo(ctx.company, pin, raw, "essl-sdk"))
+                total += n
+                results.append({"device": name, "ok": bool(n), "photos": n, "message": msg})
+            elif mode == "agent":
+                await db.devices.update_one({"id": d["id"]}, {"$set": {"pending.users": True, "pending.photos": True}})
+                results.append({"device": name, "ok": True, "photos": 0,
+                                "message": "Asked the LAN sync agent — photos arrive on its next round (about a minute)."})
+            elif mode == "adms":
+                base = int(datetime.datetime.now().timestamp()) % 100000
+                cmds = [{"id": base, "cmd": "DATA QUERY USERINFO"}, {"id": base + 1, "cmd": "DATA QUERY USERPIC"},
+                        {"id": base + 2, "cmd": "DATA QUERY BIOPHOTO"}]
+                await db.devices.update_one({"id": d["id"]}, {"$push": {"adms_commands": {"$each": cmds}}})
+                results.append({"device": name, "ok": True, "photos": 0,
+                                "message": "Asked the machine to send user photos — they arrive within a few minutes."})
+            else:
+                results.append({"device": name, "ok": False, "photos": 0,
+                                "message": "Hikvision push mode cannot be asked for photos. Use Direct pull or the LAN agent for this machine."})
+        except Exception as e:
+            results.append({"device": name, "ok": False, "photos": 0, "message": str(e)[:200]})
+    return {"ok": True, "photos": total, "results": results,
+            "with_photo": len(await codes_with_photos(ctx.cid))}
+
+
 @router.post("/devices/{did}/fetch-users")
 async def fetch_users(did: str, ctx: Ctx = Depends(company_ctx)):
     d = await _get_dev(ctx, did)
@@ -573,7 +624,10 @@ async def agent_photos(data: dict = Body(...), company=Depends(agent_company)):
         except Exception:
             pass
     if data.get("done"):
-        await db.devices.update_one({"id": dev["id"]}, {"$set": {"pending.photos": False}})
+        upd = {"pending.photos": False}
+        if data.get("message"):
+            upd["photo_result"] = {"message": str(data["message"])[:300], "at": utcnow_iso()}
+        await db.devices.update_one({"id": dev["id"]}, {"$set": upd})
     return {"ok": True, "saved": n}
 
 

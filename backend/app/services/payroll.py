@@ -97,11 +97,17 @@ def compute_slip(company, emp, month, rows, advances, adjustments=None, shift_ho
         earnings.append({"name": f"Weekly-off / holiday work ({sm['off_day_work']:g} days)", "amount": extra_pay})
 
     ot_pay = 0.0
-    if emp.get("ot_allowed", True) and sm["ot_minutes"]:
+    ot_mode = emp.get("ot_mode") or "hours"
+    if emp.get("ot_allowed", True) and ot_mode == "fixed":
+        fixed = float(emp.get("ot_fixed_amount") or 0)
+        if fixed:
+            ot_pay = _r(fixed)
+            earnings.append({"name": "Overtime (fixed monthly)", "amount": ot_pay})
+    elif emp.get("ot_allowed", True) and sm["ot_minutes"]:
         rate = float(emp.get("ot_rate_per_hour") or 0) or (per_day / (shift_hours or 8)) * float(settings.get("ot_multiplier") or 1)
         ot_pay = _r(rate * sm["ot_minutes"] / 60)
         if ot_pay:
-            earnings.append({"name": f"Overtime ({sm['ot_minutes'] / 60:.2f} hrs)", "amount": ot_pay})
+            earnings.append({"name": f"Overtime ({sm['ot_minutes'] / 60:.2f} hrs x {rate:,.2f})", "amount": ot_pay})
 
     adj = adjustments or {}
     for a in adj.get("additions") or []:
@@ -168,6 +174,8 @@ def compute_slip(company, emp, month, rows, advances, adjustments=None, shift_ho
 def shift_hours_of(shift):
     if not shift:
         return 8.0
+    if shift.get("flexible"):
+        return float(shift.get("full_day_hours") or 8)
     a, b = hm(shift["start"]), hm(shift["end"])
     mins = (b - a) % 1440 or 1440
     return max(1.0, (mins - (shift.get("break_minutes") or 0)) / 60)

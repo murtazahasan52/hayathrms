@@ -2,7 +2,7 @@
 import datetime
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from ..db import db
-from ..auth import hash_pw, check_pw, make_token, current_user, superadmin, company_ctx, owner_ctx, Ctx
+from ..auth import hash_pw, check_pw, make_token, current_user, superadmin, company_ctx, owner_ctx, Ctx, login_expired
 from ..defaults import company_settings, whatsapp_settings, DEFAULT_SHIFT, WHATSAPP_EVENTS
 from ..utils import new_id, token, utcnow_iso, now_local, strip
 from ..services.attendance import process_range
@@ -18,9 +18,11 @@ async def login(data: dict = Body(...)):
     email = (data.get("email") or "").strip().lower()
     u = await db.users.find_one({"email": email})
     if not u or not check_pw(data.get("password") or "", u.get("password_hash", "")):
-        raise HTTPException(401, "Wrong email or password")
+        raise HTTPException(401, "Wrong email / user ID or password")
     if not u.get("active", True):
         raise HTTPException(403, "Your login is disabled")
+    if login_expired(u):
+        raise HTTPException(403, login_expired(u))
     strip(u)
     u.pop("password_hash", None)
     return {"token": make_token(u), "user": u}
@@ -280,7 +282,7 @@ async def regen_agent_key(ctx: Ctx = Depends(owner_ctx)):
 
 @router.get("/company/users")
 async def company_users(ctx: Ctx = Depends(owner_ctx)):
-    return await db.users.find({"company_id": ctx.cid}, {"_id": 0, "password_hash": 0}).to_list(200)
+    return await db.users.find({"company_id": ctx.cid, "role": {"$ne": "employee"}}, {"_id": 0, "password_hash": 0}).to_list(200)
 
 
 @router.post("/company/users")
@@ -292,7 +294,8 @@ async def add_user(data: dict = Body(...), ctx: Ctx = Depends(owner_ctx)):
         raise HTTPException(400, "This email is already used")
     role = data.get("role") if data.get("role") in ("owner", "manager") else "manager"
     u = {"id": new_id(), "email": email, "name": data.get("name") or email, "role": role, "company_id": ctx.cid,
-         "active": True, "password_hash": hash_pw(data["password"]), "created_at": utcnow_iso()}
+         "active": True, "password_hash": hash_pw(data["password"]), "created_at": utcnow_iso(),
+         "valid_till": data.get("valid_till") or None}
     await db.users.insert_one(dict(u))
     u.pop("password_hash")
     return u
@@ -300,7 +303,9 @@ async def add_user(data: dict = Body(...), ctx: Ctx = Depends(owner_ctx)):
 
 @router.put("/company/users/{uid}")
 async def edit_user(uid: str, data: dict = Body(...), ctx: Ctx = Depends(owner_ctx)):
-    upd = {k: data[k] for k in ("name", "active", "role") if k in data}
+    upd = {k: data[k] for k in ("name", "active", "role", "valid_till") if k in data}
+    if upd.get("role") not in (None, "owner", "manager"):
+        upd.pop("role")
     if data.get("password"):
         upd["password_hash"] = hash_pw(data["password"])
     if uid == ctx.user["id"]:
@@ -348,3 +353,80 @@ async def dashboard(ctx: Ctx = Depends(company_ctx)):
             unregistered += 1
     return {"date": today.isoformat(), "time": now.strftime("%H:%M"), "stats": stats, "devices": devices,
             "recent": recent, "trend": trend, "late_list": late_list, "device_user_count": unregistered}
+
+
+# ---------------- super admin: every login of every shop, with validity ----------------
+LOGIN_ROLES = ("owner", "manager", "employee")
+
+
+@router.get("/admin/logins")
+async def admin_logins(user=Depends(superadmin)):
+    names = {c["id"]: c["name"] async for c in db.companies.find({}, {"_id": 0, "id": 1, "name": 1})}
+    rows = await db.users.find({"role": {"$ne": "superadmin"}}, {"_id": 0, "password_hash": 0}).to_list(5000)
+    today = datetime.date.today().isoformat()
+    for r in rows:
+        r["company_name"] = names.get(r.get("company_id"), "")
+        vt = r.get("valid_till")
+        r["state"] = "disabled" if not r.get("active", True) else ("expired" if vt and vt < today else "active")
+    rows.sort(key=lambda r: (r["company_name"], LOGIN_ROLES.index(r["role"]) if r["role"] in LOGIN_ROLES else 9, r.get("name") or ""))
+    return rows
+
+
+async def _valid_from(data):
+    if data.get("months"):
+        return (datetime.date.today() + datetime.timedelta(days=round(30.44 * int(data["months"])))).isoformat()
+    return data.get("valid_till") or None
+
+
+@router.post("/admin/logins")
+async def admin_add_login(data: dict = Body(...), user=Depends(superadmin)):
+    email = (data.get("email") or "").strip().lower()
+    if not email or len(data.get("password") or "") < 6:
+        raise HTTPException(400, "Login ID (email or mobile) and a 6+ character password are required")
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(400, "This login ID is already used")
+    c = await db.companies.find_one({"id": data.get("company_id")}, {"_id": 0, "id": 1})
+    if not c:
+        raise HTTPException(400, "Choose the shop for this login")
+    role = data.get("role") if data.get("role") in LOGIN_ROLES else "manager"
+    u = {"id": new_id(), "email": email, "name": (data.get("name") or email).strip(), "role": role, "company_id": c["id"],
+         "active": True, "password_hash": hash_pw(data["password"]), "created_at": utcnow_iso(),
+         "valid_till": await _valid_from(data)}
+    if role == "employee":
+        e = await db.employees.find_one({"id": data.get("employee_id"), "company_id": c["id"]}, {"_id": 0, "id": 1, "name": 1})
+        if not e:
+            raise HTTPException(400, "Choose the employee for this login")
+        u["employee_id"] = e["id"]
+        u["name"] = data.get("name") or e["name"]
+    await db.users.insert_one(dict(u))
+    u.pop("password_hash")
+    return u
+
+
+@router.put("/admin/logins/{uid}")
+async def admin_edit_login(uid: str, data: dict = Body(...), user=Depends(superadmin)):
+    u = await db.users.find_one({"id": uid}, {"_id": 0})
+    if not u or u["role"] == "superadmin":
+        raise HTTPException(404, "Login not found")
+    upd = {k: data[k] for k in ("name", "active") if k in data}
+    if "valid_till" in data or data.get("months"):
+        upd["valid_till"] = await _valid_from(data)
+    if data.get("role") in ("owner", "manager") and u["role"] != "employee":
+        upd["role"] = data["role"]
+    inc = {}
+    if data.get("password"):
+        if len(data["password"]) < 6:
+            raise HTTPException(400, "Password must be at least 6 characters")
+        upd["password_hash"] = hash_pw(data["password"])
+        inc = {"token_version": 1}
+    await db.users.update_one({"id": uid}, {"$set": upd, **({"$inc": inc} if inc else {})})
+    return {"ok": True, "valid_till": upd.get("valid_till", u.get("valid_till"))}
+
+
+@router.delete("/admin/logins/{uid}")
+async def admin_del_login(uid: str, user=Depends(superadmin)):
+    u = await db.users.find_one({"id": uid}, {"_id": 0, "role": 1})
+    if not u or u["role"] in ("superadmin", "owner"):
+        raise HTTPException(400, "Owner logins can't be deleted here — disable them instead")
+    await db.users.delete_one({"id": uid})
+    return {"ok": True}

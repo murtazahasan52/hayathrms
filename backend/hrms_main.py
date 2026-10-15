@@ -15,7 +15,7 @@ from app.config import CORS_ORIGINS, SUPERADMIN_EMAIL, SUPERADMIN_PASSWORD, DISA
 from app.db import db, ensure_indexes
 from app.auth import hash_pw
 from app.utils import new_id, utcnow_iso
-from app.routers import core, hr, devices, work, shifts_roster, license as license_router
+from app.routers import core, hr, devices, work, shifts_roster, license as license_router, relay as relay_router, me as me_router
 from app.services import license as lic
 from app.services.scheduler import run_scheduler, tick_all
 
@@ -24,14 +24,16 @@ app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in CORS_ORIGIN
                    allow_methods=["*"], allow_headers=["*"])
 
 app.include_router(core.router)
+app.include_router(me_router.router)
 app.include_router(hr.router)
 app.include_router(devices.router)
 app.include_router(work.router)
 app.include_router(shifts_roster.router)
 app.include_router(license_router.router)
+app.include_router(relay_router.router)
 
 # allowed without a licence: activation, login (so the super admin can reach the Licence page), health
-LICENSE_FREE = ("/api/license/", "/api/health", "/api/cron/", "/api/admin/licenses", "/api/auth/")
+LICENSE_FREE = ("/api/license/", "/api/health", "/api/cron/", "/api/admin/licenses", "/api/auth/", "/api/relay/")
 
 
 @app.middleware("http")
@@ -65,7 +67,7 @@ async def cron_tick(request: Request, key: str = ""):
     return {"ok": True, "companies": n}
 
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 
 
 @app.exception_handler(Exception)

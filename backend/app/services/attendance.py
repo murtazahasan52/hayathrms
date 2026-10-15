@@ -18,7 +18,25 @@ async def get_shifts(cid):
     return by_id, default
 
 
+def is_flexible(shift):
+    """Flexible shift: no fixed IN/OUT time. First punch of the day = IN, last punch = OUT."""
+    return bool(shift.get("flexible"))
+
+
+def day_start_min(shift):
+    return hm(shift.get("day_start") or "00:00")
+
+
+def flex_date(ts: datetime.datetime, shift):
+    """Punches before the shift's day-start time (e.g. 04:00) still belong to the previous working day."""
+    if ts.hour * 60 + ts.minute < day_start_min(shift):
+        return ts.date() - datetime.timedelta(days=1)
+    return ts.date()
+
+
 def is_overnight(shift):
+    if is_flexible(shift):
+        return False
     return hm(shift["end"]) <= hm(shift["start"])
 
 
@@ -47,6 +65,10 @@ def shift_for(emp, ds, shifts, default_shift, roster=None):
     return (shifts.get(sid) or default_shift), r
 
 
+def _fmt(t, d):
+    return t.strftime("%H:%M") if t.date() == d else t.strftime("%H:%M (+1)")
+
+
 def compute_day(d, shift, plist, settings, *, holiday=None, leave=None, employee=None, now=None, roster=None):
     """plist: list of punch docs (ts string, direction). Returns computed fields.
     roster: None, 'OFF' (weekly off given in the roster) or a shift id (working day even if normally off)."""
@@ -68,19 +90,25 @@ def compute_day(d, shift, plist, settings, *, holiday=None, leave=None, employee
         times.append(t)
         dirs.append(dr)
 
-    st_min, en_min = hm(shift["start"]), hm(shift["end"])
-    start_dt = datetime.datetime.combine(d, datetime.time()) + datetime.timedelta(minutes=st_min)
-    end_dt = datetime.datetime.combine(d, datetime.time()) + datetime.timedelta(minutes=en_min)
-    if is_overnight(shift):
-        end_dt += datetime.timedelta(days=1)
-    shift_minutes = (end_dt - start_dt).total_seconds() / 60 - (shift.get("break_minutes") or 0)
+    flexible = is_flexible(shift)
+    if flexible:
+        start_dt = datetime.datetime.combine(d, datetime.time()) + datetime.timedelta(minutes=day_start_min(shift))
+        end_dt = start_dt + datetime.timedelta(days=1)
+        shift_minutes = (shift.get("full_day_hours") or 8) * 60
+    else:
+        st_min, en_min = hm(shift["start"]), hm(shift["end"])
+        start_dt = datetime.datetime.combine(d, datetime.time()) + datetime.timedelta(minutes=st_min)
+        end_dt = datetime.datetime.combine(d, datetime.time()) + datetime.timedelta(minutes=en_min)
+        if is_overnight(shift):
+            end_dt += datetime.timedelta(days=1)
+        shift_minutes = (end_dt - start_dt).total_seconds() / 60 - (shift.get("break_minutes") or 0)
 
     t_in = t_out = None
     if times:
         t_in = times[0]
         if len(times) > 1:
             t_out = times[-1]
-        if settings.get("use_device_inout") and any(dirs):
+        if settings.get("use_device_inout") and any(dirs) and not flexible:
             ins = [t for t, dr in zip(times, dirs) if dr == "in"]
             outs = [t for t, dr in zip(times, dirs) if dr == "out"]
             t_in = ins[0] if ins else t_in
@@ -94,16 +122,26 @@ def compute_day(d, shift, plist, settings, *, holiday=None, leave=None, employee
         brk = shift.get("break_minutes") or 0
         if brk and work >= (shift.get("half_day_hours") or 4) * 60:
             work -= brk
-    if t_in and day_type == "W":
+    # inside time = sum of IN-OUT pairs (1st-2nd, 3rd-4th ...); the gaps between pairs are breaks
+    pairs, inside = [], 0
+    for i in range(0, len(times) - 1, 2):
+        pairs.append([times[i], times[i + 1]])
+        inside += (times[i + 1] - times[i]).total_seconds() / 60
+    track_late = shift.get("track_late", True) and not flexible   # False = no fixed timing: never late / early
+    track_ot = shift.get("track_ot", True)       # False = this shift never earns overtime
+    if t_in and day_type == "W" and track_late:
         diff = (t_in - start_dt).total_seconds() / 60
         if diff > (shift.get("grace_minutes") or 0):
             late = diff
-    if t_out and day_type == "W":
+    if t_out and day_type == "W" and track_late:
         diff = (end_dt - t_out).total_seconds() / 60
         if diff > (shift.get("early_grace_minutes") or 0):
             early = diff
-    if work and day_type == "W" and (employee or {}).get("ot_allowed", True):
-        extra = work - shift_minutes
+    if work and day_type == "W" and track_ot and (employee or {}).get("ot_allowed", True) \
+            and (employee or {}).get("ot_mode", "hours") != "fixed":
+        # flexible shifts (no fixed timing) earn OT only beyond the full-day hours
+        basis = shift_minutes if track_late else (shift.get("full_day_hours") or 8) * 60
+        extra = work - basis
         if extra >= (shift.get("ot_after_minutes") or 0):
             ot = extra
 
@@ -136,7 +174,9 @@ def compute_day(d, shift, plist, settings, *, holiday=None, leave=None, employee
     else:
         full = (shift.get("full_day_hours") or 7) * 60
         half = (shift.get("half_day_hours") or 4) * 60
-        if work >= full:
+        if shift.get("present_on_punch"):  # IN and OUT punched = full day, hours not checked
+            status = "P"
+        elif work >= full:
             status = "P"
         elif work >= half:
             status = "HD"
@@ -146,9 +186,13 @@ def compute_day(d, shift, plist, settings, *, holiday=None, leave=None, employee
     return {
         "day_type": day_type,
         "in_time": t_in.strftime("%H:%M") if t_in else None,
-        "out_time": t_out.strftime("%H:%M") if t_out else None,
+        "out_time": _fmt(t_out, d) if t_out else None,
         "punches": [t.strftime("%H:%M") if t.date() == d else t.strftime("%H:%M (+1)") for t in times],
         "punch_count": n,
+        "pairs": [[_fmt(a, d), _fmt(b, d)] for a, b in pairs],
+        "inside_minutes": round(inside),
+        "out_minutes": round(max(0, (t_out - t_in).total_seconds() / 60 - inside)) if t_in and t_out and n % 2 == 0 else 0,
+        "flexible": flexible,
         "work_minutes": round(work),
         "late_minutes": round(late),
         "early_minutes": round(early),
@@ -206,8 +250,11 @@ async def process_range(company, d1, d2, employee_ids=None):
         pts = _parse_ts(p["ts"])
         prev_sh, _ = shift_for(emp_map[eid], (pts.date() - datetime.timedelta(days=1)).isoformat(), shifts, default_shift, roster)
         today_sh, _ = shift_for(emp_map[eid], pts.date().isoformat(), shifts, default_shift, roster)
-        ad = attendance_date(pts, prev_sh) if is_overnight(prev_sh) else pts.date()
-        if ad != pts.date() and not is_overnight(today_sh):
+        if is_flexible(today_sh):
+            ad = flex_date(pts, today_sh)
+        else:
+            ad = attendance_date(pts, prev_sh) if is_overnight(prev_sh) else pts.date()
+        if ad != pts.date() and not is_overnight(today_sh) and not is_flexible(today_sh):
             # morning punch after a night shift: belongs to today if it is close to today's day-shift start
             if pts.hour * 60 + pts.minute >= hm(today_sh["start"]) - 120:
                 ad = pts.date()

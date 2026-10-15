@@ -36,6 +36,12 @@ async def _company_tick(company):
     w = whatsapp_settings(company)
     if not w.get("enabled"):
         return
+    # 3a. outbox: messages that waited for the internet
+    try:
+        from .whatsapp import retry_queued
+        await retry_queued(company)
+    except Exception:
+        traceback.print_exc()
     mins = now.hour * 60 + now.minute
     flags = company.get("sched_flags") or {}
     for key, time_key, fn in (("daily_summary", "daily_summary_time", send_daily_summary),

@@ -15,7 +15,7 @@ from ..services.sync import purge_punches
 from ..services.photos import photo_key, photo_url
 from ..services.payroll import compute_slip, shift_hours_of
 from ..services.payslip_pdf import payslip_pdf
-from ..services import whatsapp
+from ..services import whatsapp, relay
 from ..services.exports import Table, send
 from ..services.scheduler import send_daily_summary, send_absent_alerts
 from .devices import server_base
@@ -412,11 +412,24 @@ async def send_slips(request: Request, data: dict = Body(...), ctx: Ctx = Depend
         if not s.get("phone"):
             results.append({"employee": s["employee_name"], "status": "failed", "response": "No mobile number"})
             continue
-        link = f"{base}/api/public/payslip/{s['token']}.pdf"
-        log = await whatsapp.send_event(ctx.company, "payslip", s["phone"],
-                                        {"name": s["employee_name"], "month": month_label, "net": f"Rs. {s['net']:.0f}",
-                                         "link": link, "company": ctx.company["name"]},
-                                        employee_id=s["employee_id"], media_url=link, force=True)
+        values = {"name": s["employee_name"], "month": month_label, "net": f"Rs. {s['net']:.0f}", "company": ctx.company["name"]}
+        retry = {"kind": "payslip", "slip_id": s["id"], "base": base, "values": values}
+        try:
+            if not whatsapp_settings(ctx.company).get("enabled"):
+                link = f"{base}/api/public/payslip/{s['token']}.pdf"   # WhatsApp off: nothing is uploaded
+            else:
+                link = await relay.payslip_link(s, base)   # own public link, or put online through the Hayat relay
+        except relay.Offline:
+            log = await whatsapp.queue(ctx.company, "payslip", s["phone"], dict(values, link="(link)"),
+                                       employee_id=s["employee_id"], retry=retry)
+            await db.payslips.update_one({"id": s["id"]}, {"$set": {"whatsapp_status": "queued", "whatsapp_at": utcnow_iso()}})
+            results.append({"employee": s["employee_name"], "status": "queued", "response": log["response"]})
+            continue
+        except relay.RelayError as e:
+            results.append({"employee": s["employee_name"], "status": "failed", "response": str(e)})
+            continue
+        log = await whatsapp.send_event(ctx.company, "payslip", s["phone"], dict(values, link=link),
+                                        employee_id=s["employee_id"], media_url=link, force=True, retry=retry)
         await db.payslips.update_one({"id": s["id"]}, {"$set": {"whatsapp_status": log["status"], "whatsapp_at": utcnow_iso()}})
         results.append({"employee": s["employee_name"], "status": log["status"], "response": log.get("response")})
     if data.get("notify_owner", True) and not data.get("slip_ids"):
@@ -452,6 +465,42 @@ async def wa_save(data: dict = Body(...), ctx: Ctx = Depends(owner_ctx)):
 async def wa_test(data: dict = Body(...), ctx: Ctx = Depends(owner_ctx)):
     return await whatsapp.send_template(ctx.company, data.get("phone"), data.get("template"), data.get("params") or "",
                                         event="test", media_url=data.get("media_url") or None)
+
+
+@router.get("/whatsapp/connection")
+async def wa_connection(request: Request, ctx: Ctx = Depends(owner_ctx)):
+    """Is this install able to send WhatsApp (internet) and salary-slip PDFs (public link or relay)?"""
+    import httpx
+    base = (PUBLIC_BASE_URL or server_base(request)).rstrip("/")
+    out = {"public": relay.is_public(base), "base": base, "relay": await relay.relay_server(), "internet": False,
+           "relay_ok": False, "queued": await db.whatsapp_logs.count_documents({"company_id": ctx.cid, "status": "queued"})}
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(out["relay"] + "/api/health", params={"db_check": 0})
+        out["internet"] = True
+        out["relay_ok"] = r.status_code == 200
+    except Exception as e:
+        out["error"] = e.__class__.__name__
+    out["has_key"] = bool(await relay.relay_key())
+    if out["public"]:
+        out["message"] = "This server is on the internet — salary slip PDFs use its own link."
+    elif not out["internet"]:
+        out["message"] = "No internet on this computer right now. Messages wait in the outbox and go out when it is back."
+    elif not out["has_key"]:
+        out["message"] = "Internet is fine, but this computer has no licence key, so salary slip PDFs cannot be put online."
+    elif not out["relay_ok"]:
+        out["message"] = "Internet is fine, but the Hayat PDF link server is not answering. Text messages still go out."
+    else:
+        out["message"] = "Ready: text messages go out directly, salary slip PDFs are put online through the Hayat link server."
+    return out
+
+
+@router.post("/whatsapp/retry")
+async def wa_retry(ctx: Ctx = Depends(owner_ctx)):
+    await db.whatsapp_logs.update_many({"company_id": ctx.cid, "status": "queued"}, {"$set": {"next_try_at": ""}})
+    n = await whatsapp.retry_queued(ctx.company, limit=200)
+    left = await db.whatsapp_logs.count_documents({"company_id": ctx.cid, "status": "queued"})
+    return {"ok": True, "sent": n, "waiting": left}
 
 
 @router.post("/whatsapp/run")

@@ -126,5 +126,6 @@ def whatsapp_settings(company):
 DEFAULT_SHIFT = {
     "name": "General (9 to 6)", "start": "09:00", "end": "18:00", "grace_minutes": 10,
     "early_grace_minutes": 10, "full_day_hours": 7.0, "half_day_hours": 4.0, "break_minutes": 0,
-    "ot_after_minutes": 30, "weekly_off": [6], "is_default": True,
+    "ot_after_minutes": 30, "weekly_off": [6], "is_default": True, "track_late": True, "track_ot": True,
+    "present_on_punch": False,
 }
