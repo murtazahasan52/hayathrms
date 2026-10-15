@@ -8,9 +8,24 @@ except Exception:
     pass
 
 APP_NAME = os.environ.get("APP_NAME", "Hayat HRMS")
-MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+def _pick_mongo_url():
+    """MONGO_URL, or the MONGODB_URI / MONGODB_URL that Vercel's MongoDB Atlas integration adds by itself.
+    A value that is not a mongodb:// address (e.g. left-over example text) is skipped."""
+    for name in ("MONGO_URL", "MONGODB_URI", "MONGODB_URL", "DATABASE_URL"):
+        v = (os.environ.get(name) or "").strip().strip('"').strip("'")
+        if v.upper().startswith("MONGO_URL="):
+            v = v.split("=", 1)[1].strip()
+        if v.startswith(("mongodb://", "mongodb+srv://")):
+            return v
+    return os.environ.get("MONGO_URL") or "mongodb://localhost:27017"
+
+
+MONGO_URL = _pick_mongo_url()
 DB_NAME = os.environ.get("DB_NAME", "hayat_hrms")
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret-in-production")
+# no JWT_SECRET set: derive one from the database address (which holds the DB password), so it is
+# unique and private for every deployment instead of a fixed known text
+JWT_SECRET = os.environ.get("JWT_SECRET") or ("hayat-" + __import__("hashlib").sha256(
+    ("hayat-hrms-jwt|" + MONGO_URL).encode()).hexdigest())
 JWT_HOURS = int(os.environ.get("JWT_HOURS", "72"))
 SUPERADMIN_EMAIL = os.environ.get("SUPERADMIN_EMAIL", "murtaza@hayatcctv.com")
 SUPERADMIN_PASSWORD = os.environ.get("SUPERADMIN_PASSWORD", "Admin@123")

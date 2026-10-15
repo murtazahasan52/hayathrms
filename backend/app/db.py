@@ -46,7 +46,14 @@ else:
     _url = clean_mongo_url(MONGO_URL)
     if "<db_password>" in MONGO_URL or "<password>" in MONGO_URL:
         DB_ERROR = "MONGO_URL still contains <db_password> — put your real Atlas database password in its place."
+    elif not _url.startswith(("mongodb://", "mongodb+srv://")):
+        # e.g. the example text 'paste-your-mongodb+srv-address-here' was saved instead of the real address
+        DB_ERROR = ("MONGO_URL is not a MongoDB address (it must start with mongodb+srv:// or mongodb://). "
+                    "In Vercel → Settings → Environment Variables, paste the connection string from MongoDB Atlas → "
+                    "Connect → Drivers, then Redeploy.")
     try:
+        if DB_ERROR and not DB_ERROR.startswith("MONGO_URL still"):
+            raise ValueError(DB_ERROR)
         client = AsyncIOMotorClient(_url, serverSelectionTimeoutMS=6000)  # fail fast with a clear message if MongoDB is down
         db = client[DB_NAME]
     except Exception as e:  # bad MONGO_URL must not crash the whole site

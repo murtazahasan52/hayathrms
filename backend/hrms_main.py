@@ -82,6 +82,10 @@ async def server_error(request: Request, exc: Exception):
         return JSONResponse({"detail": "Database login failed — check the user name and password inside MONGO_URL "
                                        "(MongoDB Atlas → Database Access)."}, 503)
     if name in ("ServerSelectionTimeoutError", "AutoReconnect", "NetworkTimeout", "ConnectionFailure", "ConfigurationError"):
+        if os.environ.get("VERCEL"):
+            return JSONResponse({"detail": "Database (MongoDB Atlas) not reachable. Check MONGO_URL in Vercel → Settings → "
+                                           "Environment Variables, and in Atlas → Network Access allow 0.0.0.0/0. Then Redeploy. "
+                                           "Details: " + str(exc)[:160]}, 503)
         return JSONResponse({"detail": "Database (MongoDB) is not running or not reachable. On the PC: double-click "
                                        "'Stop Hayat HRMS', then open 'Hayat HRMS' again. Details: " + str(exc)[:160]}, 503)
     return JSONResponse({"detail": f"Server error ({name}): {str(exc)[:300]} — see local\\app.log"}, 500)
